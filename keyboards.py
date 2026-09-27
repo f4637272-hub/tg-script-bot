@@ -14,6 +14,7 @@ def admin_keyboard():
         [InlineKeyboardButton(text="📋 Список скриптов", callback_data="admin_list")],
         [InlineKeyboardButton(text="📝 Создать пост в канал", callback_data="admin_post_custom")],
         [InlineKeyboardButton(text="🗑 Удалить скрипт", callback_data="admin_del")],
+        [InlineKeyboardButton(text="👥 Управление админами", callback_data="admin_manage")],
     ])
 
 def back_to_admin_keyboard():
@@ -35,7 +36,6 @@ def del_scripts_keyboard(scripts):
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def post_type_keyboard():
-    """Выбор: с фото или без"""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📷 Пост с фото", callback_data="post_with_photo")],
         [InlineKeyboardButton(text="📄 Пост без фото", callback_data="post_no_photo")],
@@ -43,7 +43,6 @@ def post_type_keyboard():
     ])
 
 def skip_photo_keyboard():
-    """Пропустить шаг с фото"""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⏭ Пропустить фото", callback_data="skip_photo")],
         [InlineKeyboardButton(text="⬅ Назад", callback_data="admin_back")]
@@ -67,3 +66,23 @@ def post_preview_keyboard():
         [InlineKeyboardButton(text="🖼 Изменить фото", callback_data="edit_post_photo")],
         [InlineKeyboardButton(text="⬅ Отмена", callback_data="admin_back")]
     ])
+
+# ==================== АДМИНЫ ====================
+def admins_menu_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить админа", callback_data="admin_add_user")],
+        [InlineKeyboardButton(text="📋 Список админов", callback_data="admin_list_users")],
+        [InlineKeyboardButton(text="➖ Удалить админа", callback_data="admin_del_user")],
+        [InlineKeyboardButton(text="⬅ Назад", callback_data="admin_back")],
+    ])
+
+def del_admins_keyboard(db_admins):
+    buttons = [
+        [InlineKeyboardButton(
+            text=f"➖ {uname} ({uid})",
+            callback_data=f"rmadmin_{uid}"
+        )]
+        for uid, uname in db_admins
+    ]
+    buttons.append([InlineKeyboardButton(text="⬅ Назад", callback_data="admin_manage")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)

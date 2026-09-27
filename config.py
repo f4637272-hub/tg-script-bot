@@ -3,28 +3,36 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-BOT_USERNAME = os.getenv("BOT_USERNAME")
-ADMIN_ID = int(os.getenv("ADMIN_ID"))
-CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
-CHAT_ID = int(os.getenv("CHAT_ID"))
-CHANNEL_URL = os.getenv("CHANNEL_URL")
-CHAT_URL = os.getenv("CHAT_URL")
+def get_env(key: str, required: bool = True, default=None):
+    value = os.getenv(key, default)
+    if required and value is None:
+        raise ValueError(f"❌ Переменная {key} не задана в окружении!")
+    return value
 
-# Прокси (на Render не нужен, оставь пустым)
-PROXY_URL = os.getenv("PROXY_URL", "").strip() or None
+BOT_TOKEN = get_env("BOT_TOKEN")
+BOT_USERNAME = get_env("BOT_USERNAME")
 
-# ===== ВЕБХУК =====
-# На Render подставляется автоматически из переменной RENDER_EXTERNAL_URL
-WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "https://your-app.onrender.com")
+# Супер-админы (через запятую в ADMIN_IDS). Их нельзя удалить через бота.
+ADMIN_IDS = [
+    int(x.strip())
+    for x in get_env("ADMIN_IDS", default="").split(",")
+    if x.strip()
+]
+
+CHANNEL_ID = int(get_env("CHANNEL_ID"))
+CHAT_ID = int(get_env("CHAT_ID"))
+CHANNEL_URL = get_env("CHANNEL_URL")
+CHAT_URL = get_env("CHAT_URL")
+
+PROXY_URL = get_env("PROXY_URL", required=False, default="") or None
+
+WEBHOOK_HOST = get_env("WEBHOOK_HOST")
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 
-# Локальный порт для веб-сервера (Render даёт свой через PORT)
 WEB_SERVER_HOST = "0.0.0.0"
 WEB_SERVER_PORT = int(os.getenv("PORT", 8080))
 
-# Секретный токен для верификации вебхука
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change_me_123456")
+WEBHOOK_SECRET = get_env("WEBHOOK_SECRET")
 
 DB_PATH = "scripts.db"
