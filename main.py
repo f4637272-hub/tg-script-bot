@@ -10,28 +10,23 @@ from aiogram.client.session.aiohttp import AiohttpSession
 
 from config import (
     BOT_TOKEN, BOT_USERNAME, ADMIN_IDS,
-    CHANNEL_ID, CHAT_ID, PROXY_URL,
-    WEBHOOK_URL, WEBHOOK_PATH, WEBHOOK_SECRET,
-    WEB_SERVER_HOST, WEB_SERVER_PORT
+    CHANNEL_ID, CHAT_ID, PROXY_URL, LOG_CHANNEL_ID
 )
 from database import (
-    init_db, add_script, get_script,
-    get_all_scripts, delete_script,
-    is_admin, add_admin, remove_admin, get_all_admins
+    init_db, add_script, get_script, get_all_scripts, update_script, delete_script,
+    increment_views, is_admin, add_admin, remove_admin, get_all_admins,
+    register_user, is_banned, ban_user, get_all_user_ids, get_user,
+    get_setting, set_setting, get_stats
 )
 from keyboards import (
-    sub_keyboard, admin_keyboard, back_to_admin_keyboard,
-    cancel_keyboard, del_scripts_keyboard,
-    post_type_keyboard, skip_photo_keyboard,
-    scripts_select_keyboard, post_preview_keyboard,
-    admins_menu_keyboard, del_admins_keyboard
+    sub_keyboard, admin_keyboard, back_admin,
+    scripts_menu, scripts_list_kb, script_actions_kb, script_del_confirm,
+    post_type_kb, skip_photo_kb, scripts_select_kb, post_preview_kb,
+    users_menu, broadcast_confirm_kb,
+    admins_menu, del_admins_kb, settings_menu
 )
-from webhook_server import run_server
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
 
 if PROXY_URL:
@@ -42,561 +37,666 @@ else:
 
 dp = Dispatcher(storage=MemoryStorage())
 
-# ==================== FSM ====================
-class AdminStates(StatesGroup):
-    waiting_name = State()
-    waiting_content = State()
-    waiting_post_photo = State()
-    waiting_post_text = State()
-    selecting_scripts = State()
-    waiting_new_admin = State()
+class S(StatesGroup):
+    script_name = State()
+    script_content = State()
+    script_category = State()
+    script_edit = State()
+    post_photo = State()
+    post_text = State()
+    post_select = State()
+    admin_new = State()
+    broadcast = State()
+    ban = State()
+    unban = State()
+    welcome = State()
 
-# ==================== ПРОВЕРКА ПОДПИСОК ====================
-async def is_subscribed(user_id: int) -> bool:
+# ============== УТИЛИТЫ ==============
+async def is_subscribed(uid):
     try:
-        m1 = await bot.get_chat_member(CHANNEL_ID, user_id)
-        m2 = await bot.get_chat_member(CHAT_ID, user_id)
-        valid = ["member", "administrator", "creator"]
-        return m1.status in valid and m2.status in valid
+        m1 = await bot.get_chat_member(CHANNEL_ID, uid)
+        m2 = await bot.get_chat_member(CHAT_ID, uid)
+        ok = ["member", "administrator", "creator"]
+        return m1.status in ok and m2.status in ok
     except Exception as e:
-        logger.error(f"Ошибка проверки подписки: {e}")
+        logger.error(f"Подписка: {e}")
         return False
 
-# ==================== /start ====================
+async def log_action(text):
+    if not LOG_CHANNEL_ID:
+        return
+    try:
+        await bot.send_message(LOG_CHANNEL_ID, f"📋 {text}", parse_mode="HTML")
+    except Exception:
+        pass
+
+async def admin_guard(event):
+    uid = event.from_user.id
+    if not await is_admin(uid):
+        if isinstance(event, types.CallbackQuery):
+            await event.answer("⛔ Нет доступа.", show_alert=True)
+        return False
+    return True
+
+# ============== /start ==============
 @dp.message(CommandStart())
-async def cmd_start(message: types.Message, state: FSMContext):
+async def cmd_start(msg: types.Message, state: FSMContext):
     await state.clear()
-    args = message.text.split()
+    u = msg.from_user
+
+    if await is_banned(u.id):
+        await msg.answer("🚫 Ты забанен.")
+        return
+
+    await register_user(u.id, u.username, u.first_name)
+
+    if await get_setting("maintenance") == "1" and not await is_admin(u.id):
+        await msg.answer("🔧 Бот на обслуживании. Зайди позже.")
+        return
+
+    args = msg.text.split()
     payload = args[1] if len(args) > 1 else None
 
-    if not await is_subscribed(message.from_user.id):
-        await message.answer(
-            "🔒 Для доступа подпишись на канал и чат:",
-            reply_markup=sub_keyboard()
-        )
+    if not await is_subscribed(u.id):
+        await msg.answer("🔒 Подпишись на канал и чат:", reply_markup=sub_keyboard())
         return
 
     if payload and payload.startswith("script_"):
         try:
-            script_id = int(payload.split("_")[1])
+            sid = int(payload.split("_")[1])
         except (ValueError, IndexError):
-            await message.answer("❌ Неверная ссылка.")
+            await msg.answer("❌ Неверная ссылка.")
             return
-        script = await get_script(script_id)
-        if not script:
-            await message.answer("❌ Скрипт не найден.")
+        sc = await get_script(sid)
+        if not sc:
+            await msg.answer("❌ Скрипт не найден.")
             return
-        name, content = script
-        await message.answer(
-            f"📜 <b>{name}</b>\n\n<code>{content}</code>",
+        await increment_views(sid, u.id)
+        _, name, content, cat, _ = sc
+        await msg.answer(
+            f"📜 <b>{name}</b>\n🏷 {cat}\n\n<code>{content}</code>",
             parse_mode="HTML"
         )
     else:
-        await message.answer("👋 Привет! Выбери скрипт в канале.")
+        welcome = await get_setting("welcome_text", "👋 Привет!")
+        await msg.answer(welcome)
 
 @dp.callback_query(F.data == "check_sub")
-async def check_sub(callback: types.CallbackQuery):
-    if await is_subscribed(callback.from_user.id):
-        await callback.message.edit_text("✅ Подписка подтверждена!")
+async def check_sub(cb: types.CallbackQuery):
+    if await is_subscribed(cb.from_user.id):
+        await cb.message.edit_text("✅ Подписка подтверждена! Жми кнопку в канале.")
     else:
-        await callback.answer("❌ Не подписан!", show_alert=True)
+        await cb.answer("❌ Не подписан!", show_alert=True)
 
-# ==================== АДМИН-ПАНЕЛЬ ====================
+# ============== /admin ==============
 @dp.message(Command("admin"))
-async def admin_panel(message: types.Message, state: FSMContext):
-    if not await is_admin(message.from_user.id):
+async def admin_panel(msg: types.Message, state: FSMContext):
+    if not await is_admin(msg.from_user.id):
         return
     await state.clear()
-    await message.answer(
-        "🛠 <b>Админ-панель</b>",
-        parse_mode="HTML",
-        reply_markup=admin_keyboard()
-    )
+    await msg.answer("🛠 <b>Админ-панель</b>", parse_mode="HTML", reply_markup=admin_keyboard())
 
 @dp.callback_query(F.data == "admin_back")
-async def admin_back(callback: types.CallbackQuery, state: FSMContext):
-    if not await is_admin(callback.from_user.id):
+async def admin_back(cb: types.CallbackQuery, state: FSMContext):
+    if not await admin_guard(cb):
         return
     await state.clear()
     try:
-        await callback.message.delete()
+        await cb.message.delete()
     except Exception:
         pass
-    await callback.message.answer(
-        "🛠 <b>Админ-панель</b>",
-        parse_mode="HTML",
-        reply_markup=admin_keyboard()
-    )
-    await callback.answer()
+    await cb.message.answer("🛠 <b>Админ-панель</b>",
+                            parse_mode="HTML", reply_markup=admin_keyboard())
+    await cb.answer()
 
-# ==================== ДОБАВЛЕНИЕ СКРИПТА ====================
-@dp.callback_query(F.data == "admin_add")
-async def admin_add(callback: types.CallbackQuery, state: FSMContext):
-    if not await is_admin(callback.from_user.id):
+# ============== СКРИПТЫ ==============
+@dp.callback_query(F.data == "menu_scripts")
+async def menu_scripts(cb: types.CallbackQuery):
+    if not await admin_guard(cb):
         return
-    await callback.message.edit_text(
-        "📝 Введи <b>название</b> скрипта:",
-        parse_mode="HTML",
-        reply_markup=cancel_keyboard()
-    )
-    await state.set_state(AdminStates.waiting_name)
-    await callback.answer()
+    await cb.message.edit_text("📜 <b>Управление скриптами</b>",
+                               parse_mode="HTML", reply_markup=scripts_menu())
+    await cb.answer()
 
-@dp.message(AdminStates.waiting_name)
-async def process_name(message: types.Message, state: FSMContext):
-    if not await is_admin(message.from_user.id):
+@dp.callback_query(F.data == "script_add")
+async def script_add(cb: types.CallbackQuery, state: FSMContext):
+    if not await admin_guard(cb):
         return
-    await state.update_data(name=message.text)
-    await message.answer(
-        "📝 Теперь отправь <b>текст скрипта</b>:",
-        parse_mode="HTML",
-        reply_markup=cancel_keyboard()
-    )
-    await state.set_state(AdminStates.waiting_content)
+    await cb.message.edit_text("📝 Введи <b>название</b> скрипта:",
+                               parse_mode="HTML", reply_markup=back_admin())
+    await state.set_state(S.script_name)
+    await cb.answer()
 
-@dp.message(AdminStates.waiting_content)
-async def process_content(message: types.Message, state: FSMContext):
-    if not await is_admin(message.from_user.id):
+@dp.message(S.script_name)
+async def s_name(msg: types.Message, state: FSMContext):
+    if not await is_admin(msg.from_user.id):
         return
-    data = await state.get_data()
-    script_id = await add_script(data["name"], message.text)
-    link = f"https://t.me/{BOT_USERNAME}?start=script_{script_id}"
-    await message.answer(
-        f"✅ <b>Скрипт сохранён!</b>\n\n"
-        f"🆔 ID: <code>{script_id}</code>\n"
-        f"📛 Название: {data['name']}\n"
-        f"🔗 <code>{link}</code>",
-        parse_mode="HTML",
-        reply_markup=back_to_admin_keyboard()
-    )
+    await state.update_data(name=msg.text)
+    await msg.answer("📝 Отправь <b>текст скрипта</b>:", parse_mode="HTML",
+                     reply_markup=back_admin())
+    await state.set_state(S.script_content)
+
+@dp.message(S.script_content)
+async def s_content(msg: types.Message, state: FSMContext):
+    if not await is_admin(msg.from_user.id):
+        return
+    await state.update_data(content=msg.text)
+    await msg.answer("🏷 Введи <b>категорию</b> (или напиши «Общее»):",
+                     parse_mode="HTML", reply_markup=back_admin())
+    await state.set_state(S.script_category)
+
+@dp.message(S.script_category)
+async def s_cat(msg: types.Message, state: FSMContext):
+    if not await is_admin(msg.from_user.id):
+        return
+    d = await state.get_data()
+    sid = await add_script(d["name"], d["content"], msg.text, msg.from_user.id)
+    link = f"https://t.me/{BOT_USERNAME}?start=script_{sid}"
+    await msg.answer(
+        f"✅ <b>Скрипт сохранён!</b>\n\n🆔 <code>{sid}</code>\n"
+        f"📛 {d['name']}\n🏷 {msg.text}\n🔗 <code>{link}</code>",
+        parse_mode="HTML", reply_markup=back_admin())
+    await log_action(f"➕ Скрипт #{sid} «{d['name']}» от {msg.from_user.id}")
     await state.clear()
 
-# ==================== СПИСОК ====================
-@dp.callback_query(F.data == "admin_list")
-async def admin_list(callback: types.CallbackQuery):
-    if not await is_admin(callback.from_user.id):
+@dp.callback_query(F.data == "script_list")
+async def script_list(cb: types.CallbackQuery):
+    if not await admin_guard(cb):
         return
     scripts = await get_all_scripts()
     if not scripts:
-        await callback.answer("Скриптов нет.", show_alert=True)
+        await cb.answer("Пусто.", show_alert=True)
         return
-    text = "📋 <b>Все скрипты:</b>\n\n"
-    for sid, name in scripts:
-        text += f"🆔 <code>{sid}</code> — {name}\n"
-    await callback.message.edit_text(
-        text,
-        parse_mode="HTML",
-        reply_markup=back_to_admin_keyboard()
-    )
-    await callback.answer()
+    await cb.message.edit_text("📋 <b>Все скрипты:</b>",
+                               parse_mode="HTML",
+                               reply_markup=scripts_list_kb(scripts))
+    await cb.answer()
 
-# ==================== УДАЛЕНИЕ ====================
-@dp.callback_query(F.data == "admin_del")
-async def admin_del_prompt(callback: types.CallbackQuery):
-    if not await is_admin(callback.from_user.id):
+@dp.callback_query(F.data.startswith("script_view_"))
+async def script_view(cb: types.CallbackQuery):
+    if not await admin_guard(cb):
         return
-    scripts = await get_all_scripts()
-    if not scripts:
-        await callback.answer("Нечего удалять.", show_alert=True)
+    sid = int(cb.data.split("_")[2])
+    sc = await get_script(sid)
+    if not sc:
+        await cb.answer("Не найден.", show_alert=True)
         return
-    await callback.message.edit_text(
-        "Выбери скрипт для удаления:",
-        reply_markup=del_scripts_keyboard(scripts)
-    )
-    await callback.answer()
+    _, n, content, cat, v = sc
+    txt = f"📜 <b>{n}</b>\n🏷 {cat}\n👁 {v}\n\n<code>{content[:500]}</code>"
+    await cb.message.edit_text(txt, parse_mode="HTML",
+                               reply_markup=script_actions_kb(sid))
+    await cb.answer()
 
-@dp.callback_query(F.data.startswith("del_"))
-async def admin_del(callback: types.CallbackQuery):
-    if not await is_admin(callback.from_user.id):
+@dp.callback_query(F.data.startswith("script_editname_"))
+async def script_edit_name(cb: types.CallbackQuery, state: FSMContext):
+    if not await admin_guard(cb):
         return
-    sid = int(callback.data.split("_")[1])
+    sid = int(cb.data.split("_")[2])
+    await state.update_data(sid=sid, field="name")
+    await cb.message.answer("✏️ Отправь <b>новое название</b>:",
+                            parse_mode="HTML", reply_markup=back_admin())
+    await state.set_state(S.script_edit)
+    await cb.answer()
+
+@dp.callback_query(F.data.startswith("script_editcontent_"))
+async def script_edit_content(cb: types.CallbackQuery, state: FSMContext):
+    if not await admin_guard(cb):
+        return
+    sid = int(cb.data.split("_")[2])
+    await state.update_data(sid=sid, field="content")
+    await cb.message.answer("📝 Отправь <b>новый текст</b>:",
+                            parse_mode="HTML", reply_markup=back_admin())
+    await state.set_state(S.script_edit)
+    await cb.answer()
+
+@dp.callback_query(F.data.startswith("script_editcat_"))
+async def script_edit_cat(cb: types.CallbackQuery, state: FSMContext):
+    if not await admin_guard(cb):
+        return
+    sid = int(cb.data.split("_")[2])
+    await state.update_data(sid=sid, field="category")
+    await cb.message.answer("🏷 Отправь <b>новую категорию</b>:",
+                            parse_mode="HTML", reply_markup=back_admin())
+    await state.set_state(S.script_edit)
+    await cb.answer()
+
+@dp.message(S.script_edit)
+async def s_edit(msg: types.Message, state: FSMContext):
+    if not await is_admin(msg.from_user.id):
+        return
+    d = await state.get_data()
+    await update_script(d["sid"], **{d["field"]: msg.text})
+    await msg.answer("✅ Обновлено.", reply_markup=back_admin())
+    await state.clear()
+
+@dp.callback_query(F.data.startswith("script_del_"))
+async def script_del(cb: types.CallbackQuery):
+    if not await admin_guard(cb):
+        return
+    sid = int(cb.data.split("_")[2])
+    await cb.message.edit_text(f"🗑 Удалить скрипт <code>{sid}</code>?",
+                               parse_mode="HTML",
+                               reply_markup=script_del_confirm(sid))
+    await cb.answer()
+
+@dp.callback_query(F.data.startswith("script_delconfirm_"))
+async def script_del_ok(cb: types.CallbackQuery):
+    if not await admin_guard(cb):
+        return
+    sid = int(cb.data.split("_")[2])
     await delete_script(sid)
-    await callback.message.edit_text(
-        f"✅ Скрипт <code>{sid}</code> удалён.",
-        parse_mode="HTML",
-        reply_markup=back_to_admin_keyboard()
-    )
-    await callback.answer()
+    await cb.message.edit_text(f"✅ Удалён #{sid}.", reply_markup=back_admin())
+    await cb.answer()
 
-# ==================== СОЗДАНИЕ ПОСТА ====================
+# ============== СОЗДАНИЕ ПОСТА ==============
 @dp.callback_query(F.data == "admin_post_custom")
-async def admin_post_start(callback: types.CallbackQuery, state: FSMContext):
-    if not await is_admin(callback.from_user.id):
+async def post_start(cb: types.CallbackQuery, state: FSMContext):
+    if not await admin_guard(cb):
         return
     await state.clear()
-    await callback.message.edit_text(
-        "📝 <b>Создание поста</b>\n\nВыбери тип поста:",
-        parse_mode="HTML",
-        reply_markup=post_type_keyboard()
-    )
-    await callback.answer()
+    await cb.message.edit_text("📝 <b>Создание поста</b>\n\nВыбери тип:",
+                               parse_mode="HTML", reply_markup=post_type_kb())
+    await cb.answer()
 
 @dp.callback_query(F.data == "post_with_photo")
-async def post_with_photo(callback: types.CallbackQuery, state: FSMContext):
-    if not await is_admin(callback.from_user.id):
+async def post_photo(cb: types.CallbackQuery, state: FSMContext):
+    if not await admin_guard(cb):
         return
-    await callback.message.edit_text(
-        "📷 Отправь <b>фото</b> для поста:",
-        parse_mode="HTML",
-        reply_markup=skip_photo_keyboard()
-    )
-    await state.set_state(AdminStates.waiting_post_photo)
-    await callback.answer()
+    await cb.message.edit_text("📷 Отправь <b>фото</b>:",
+                               parse_mode="HTML", reply_markup=skip_photo_kb())
+    await state.set_state(S.post_photo)
+    await cb.answer()
 
 @dp.callback_query(F.data == "post_no_photo")
-async def post_no_photo(callback: types.CallbackQuery, state: FSMContext):
-    if not await is_admin(callback.from_user.id):
+async def post_no_photo(cb: types.CallbackQuery, state: FSMContext):
+    if not await admin_guard(cb):
         return
     await state.update_data(photo_id=None)
-    await callback.message.edit_text(
-        "📝 Отправь <b>текст поста</b>:",
-        parse_mode="HTML",
-        reply_markup=cancel_keyboard()
-    )
-    await state.set_state(AdminStates.waiting_post_text)
-    await callback.answer()
+    await cb.message.edit_text("📝 Отправь <b>текст поста</b>:",
+                               parse_mode="HTML", reply_markup=back_admin())
+    await state.set_state(S.post_text)
+    await cb.answer()
 
 @dp.callback_query(F.data == "skip_photo")
-async def skip_photo(callback: types.CallbackQuery, state: FSMContext):
-    if not await is_admin(callback.from_user.id):
+async def skip_photo(cb: types.CallbackQuery, state: FSMContext):
+    if not await admin_guard(cb):
         return
     await state.update_data(photo_id=None)
-    await callback.message.edit_text(
-        "📝 Отправь <b>текст поста</b>:",
-        parse_mode="HTML",
-        reply_markup=cancel_keyboard()
-    )
-    await state.set_state(AdminStates.waiting_post_text)
-    await callback.answer()
+    await cb.message.edit_text("📝 Отправь <b>текст поста</b>:",
+                               parse_mode="HTML", reply_markup=back_admin())
+    await state.set_state(S.post_text)
+    await cb.answer()
 
-@dp.message(AdminStates.waiting_post_photo, F.photo)
-async def process_photo(message: types.Message, state: FSMContext):
-    if not await is_admin(message.from_user.id):
+@dp.message(S.post_photo, F.photo)
+async def post_get_photo(msg: types.Message, state: FSMContext):
+    if not await is_admin(msg.from_user.id):
         return
-    photo_id = message.photo[-1].file_id
-    await state.update_data(photo_id=photo_id)
-    await message.answer(
-        "✅ Фото получено!\n\n📝 Теперь отправь <b>текст поста</b>:",
-        parse_mode="HTML",
-        reply_markup=cancel_keyboard()
-    )
-    await state.set_state(AdminStates.waiting_post_text)
+    await state.update_data(photo_id=msg.photo[-1].file_id)
+    await msg.answer("✅ Фото получено. Отправь <b>текст</b>:", parse_mode="HTML",
+                     reply_markup=back_admin())
+    await state.set_state(S.post_text)
 
-@dp.message(AdminStates.waiting_post_photo)
-async def process_photo_invalid(message: types.Message):
-    if not await is_admin(message.from_user.id):
+@dp.message(S.post_photo)
+async def post_photo_bad(msg: types.Message):
+    if not await is_admin(msg.from_user.id):
         return
-    await message.answer("❌ Это не фото. Отправь картинку или нажми «Пропустить фото».")
+    await msg.answer("❌ Это не фото.")
 
-@dp.message(AdminStates.waiting_post_text)
-async def process_post_text(message: types.Message, state: FSMContext):
-    if not await is_admin(message.from_user.id):
+@dp.message(S.post_text)
+async def post_get_text(msg: types.Message, state: FSMContext):
+    if not await is_admin(msg.from_user.id):
         return
-    await state.update_data(post_text=message.html_text, selected=[])
+    await state.update_data(post_text=msg.html_text, selected=[])
     scripts = await get_all_scripts()
     if not scripts:
-        await message.answer(
-            "❌ Сначала создай хотя бы один скрипт.",
-            reply_markup=back_to_admin_keyboard()
-        )
+        await msg.answer("❌ Сначала создай скрипт.", reply_markup=back_admin())
         await state.clear()
         return
-    await message.answer(
-        "📎 <b>Выбери скрипты</b>, которые прикрепить кнопками:",
-        parse_mode="HTML",
-        reply_markup=scripts_select_keyboard(scripts, [])
-    )
-    await state.set_state(AdminStates.selecting_scripts)
+    await msg.answer("📎 <b>Выбери скрипты:</b>", parse_mode="HTML",
+                     reply_markup=scripts_select_kb(scripts, []))
+    await state.set_state(S.post_select)
 
-# ==================== ВЫБОР СКРИПТОВ ====================
-@dp.callback_query(F.data.startswith("toggle_"), AdminStates.selecting_scripts)
-async def toggle_script(callback: types.CallbackQuery, state: FSMContext):
-    if not await is_admin(callback.from_user.id):
+@dp.callback_query(F.data.startswith("toggle_"), S.post_select)
+async def post_toggle(cb: types.CallbackQuery, state: FSMContext):
+    if not await admin_guard(cb):
         return
-    sid = int(callback.data.split("_")[1])
-    data = await state.get_data()
-    selected = data.get("selected", [])
-    if sid in selected:
-        selected.remove(sid)
+    sid = int(cb.data.split("_")[1])
+    d = await state.get_data()
+    sel = d.get("selected", [])
+    if sid in sel:
+        sel.remove(sid)
     else:
-        selected.append(sid)
-    await state.update_data(selected=selected)
+        sel.append(sid)
+    await state.update_data(selected=sel)
     scripts = await get_all_scripts()
     try:
-        await callback.message.edit_reply_markup(
-            reply_markup=scripts_select_keyboard(scripts, selected)
-        )
+        await cb.message.edit_reply_markup(reply_markup=scripts_select_kb(scripts, sel))
     except Exception:
         pass
-    await callback.answer()
+    await cb.answer()
 
-# ==================== ПРЕВЬЮ ====================
-@dp.callback_query(F.data == "show_preview", AdminStates.selecting_scripts)
-async def show_preview(callback: types.CallbackQuery, state: FSMContext):
-    if not await is_admin(callback.from_user.id):
+@dp.callback_query(F.data == "show_preview", S.post_select)
+async def show_preview(cb: types.CallbackQuery, state: FSMContext):
+    if not await admin_guard(cb):
         return
-    data = await state.get_data()
-    post_text = data.get("post_text", "")
-    selected = data.get("selected", [])
-    photo_id = data.get("photo_id")
-
-    if not selected:
-        await callback.answer("Выбери хотя бы один скрипт!", show_alert=True)
+    d = await state.get_data()
+    text = d.get("post_text", "")
+    sel = d.get("selected", [])
+    photo = d.get("photo_id")
+    if not sel:
+        await cb.answer("Выбери хотя бы один скрипт!", show_alert=True)
         return
-
     scripts = await get_all_scripts()
-    selected_scripts = [(sid, name) for sid, name in scripts if sid in selected]
+    selected_scripts = [(sid, n) for sid, n, c, v in scripts if sid in sel]
     await state.update_data(selected_scripts=selected_scripts)
-
-    preview_caption = (
-        f"👁 <b>Превью поста</b>\n"
-        f"Кнопок: {len(selected_scripts)}\n"
-        f"Фото: {'есть' if photo_id else 'нет'}\n\n"
-        f"———\n\n{post_text}"
-    )
-
+    preview = (f"👁 <b>Превью</b>\nКнопок: {len(selected_scripts)}\n"
+               f"Фото: {'есть' if photo else 'нет'}\n\n———\n\n{text}")
     try:
-        await callback.message.delete()
+        await cb.message.delete()
     except Exception:
         pass
-
-    if photo_id:
-        await callback.message.answer_photo(
-            photo=photo_id,
-            caption=preview_caption,
-            parse_mode="HTML",
-            reply_markup=post_preview_keyboard()
-        )
+    if photo:
+        await cb.message.answer_photo(photo=photo, caption=preview,
+                                      parse_mode="HTML", reply_markup=post_preview_kb())
     else:
-        await callback.message.answer(
-            preview_caption,
-            parse_mode="HTML",
-            reply_markup=post_preview_keyboard()
-        )
-    await callback.answer()
+        await cb.message.answer(preview, parse_mode="HTML", reply_markup=post_preview_kb())
+    await cb.answer()
 
 @dp.callback_query(F.data == "edit_post_text")
-async def edit_post_text(callback: types.CallbackQuery, state: FSMContext):
-    if not await is_admin(callback.from_user.id):
+async def edit_text(cb: types.CallbackQuery, state: FSMContext):
+    if not await admin_guard(cb):
         return
-    await callback.message.answer(
-        "📝 Отправь <b>новый текст</b> поста:",
-        parse_mode="HTML",
-        reply_markup=cancel_keyboard()
-    )
-    await state.set_state(AdminStates.waiting_post_text)
-    await callback.answer()
+    await cb.message.answer("📝 Новый текст поста:", reply_markup=back_admin())
+    await state.set_state(S.post_text)
+    await cb.answer()
 
 @dp.callback_query(F.data == "edit_post_photo")
-async def edit_post_photo(callback: types.CallbackQuery, state: FSMContext):
-    if not await is_admin(callback.from_user.id):
+async def edit_photo(cb: types.CallbackQuery, state: FSMContext):
+    if not await admin_guard(cb):
         return
-    await callback.message.answer(
-        "📷 Отправь <b>новое фото</b>:",
-        parse_mode="HTML",
-        reply_markup=skip_photo_keyboard()
-    )
-    await state.set_state(AdminStates.waiting_post_photo)
-    await callback.answer()
+    await cb.message.answer("📷 Отправь новое фото:", reply_markup=skip_photo_kb())
+    await state.set_state(S.post_photo)
+    await cb.answer()
 
-# ==================== ПУБЛИКАЦИЯ ====================
 @dp.callback_query(F.data == "confirm_publish")
-async def confirm_publish(callback: types.CallbackQuery, state: FSMContext):
-    if not await is_admin(callback.from_user.id):
+async def confirm_publish(cb: types.CallbackQuery, state: FSMContext):
+    if not await admin_guard(cb):
         return
-    data = await state.get_data()
-    post_text = data.get("post_text", "")
-    photo_id = data.get("photo_id")
-    selected_scripts = data.get("selected_scripts", [])
-
-    if not selected_scripts:
-        await callback.answer("Ошибка: скрипты не выбраны.", show_alert=True)
+    d = await state.get_data()
+    text = d.get("post_text", "")
+    photo = d.get("photo_id")
+    selected = d.get("selected_scripts", [])
+    if not selected:
+        await cb.answer("Ошибка.", show_alert=True)
         return
-
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text=f"🐙 {name}",
-            url=f"https://t.me/{BOT_USERNAME}?start=script_{sid}"
-        )]
-        for sid, name in selected_scripts
+        [InlineKeyboardButton(text=f"🐙 {n}", url=f"https://t.me/{BOT_USERNAME}?start=script_{sid}")]
+        for sid, n in selected
     ])
-
     try:
-        if photo_id:
-            await bot.send_photo(
-                chat_id=CHANNEL_ID,
-                photo=photo_id,
-                caption=post_text,
-                parse_mode="HTML",
-                reply_markup=kb
-            )
+        if photo:
+            await bot.send_photo(CHANNEL_ID, photo, caption=text, parse_mode="HTML", reply_markup=kb)
         else:
-            await bot.send_message(
-                chat_id=CHANNEL_ID,
-                text=post_text,
-                parse_mode="HTML",
-                reply_markup=kb
-            )
+            await bot.send_message(CHANNEL_ID, text, parse_mode="HTML", reply_markup=kb)
         try:
-            await callback.message.delete()
+            await cb.message.delete()
         except Exception:
             pass
-        await callback.message.answer(
-            "✅ Пост опубликован в канал!",
-            reply_markup=back_to_admin_keyboard()
-        )
+        await cb.message.answer("✅ Пост опубликован!", reply_markup=back_admin())
+        await log_action(f"📝 Пост опубликован админом {cb.from_user.id}")
     except Exception as e:
-        await callback.message.answer(
-            f"❌ Ошибка публикации: {e}",
-            reply_markup=back_to_admin_keyboard()
-        )
+        await cb.message.answer(f"❌ {e}", reply_markup=back_admin())
     await state.clear()
-    await callback.answer()
+    await cb.answer()
 
-# ==================== УПРАВЛЕНИЕ АДМИНАМИ ====================
-@dp.callback_query(F.data == "admin_manage")
-async def admin_manage(callback: types.CallbackQuery):
-    if not await is_admin(callback.from_user.id):
+# ============== ЮЗЕРЫ ==============
+@dp.callback_query(F.data == "menu_users")
+async def menu_users(cb: types.CallbackQuery):
+    if not await admin_guard(cb):
         return
-    await callback.message.edit_text(
-        "👥 <b>Управление админами</b>\n\n"
-        "<i>Супер-админы из .env не могут быть удалены.</i>",
-        parse_mode="HTML",
-        reply_markup=admins_menu_keyboard()
-    )
-    await callback.answer()
+    await cb.message.edit_text("👥 <b>Пользователи</b>", parse_mode="HTML",
+                               reply_markup=users_menu())
+    await cb.answer()
+
+@dp.callback_query(F.data == "broadcast_start")
+async def broadcast_start(cb: types.CallbackQuery, state: FSMContext):
+    if not await admin_guard(cb):
+        return
+    await cb.message.edit_text("📢 Отправь <b>текст рассылки</b>:",
+                               parse_mode="HTML", reply_markup=back_admin())
+    await state.set_state(S.broadcast)
+    await cb.answer()
+
+@dp.message(S.broadcast)
+async def broadcast_text(msg: types.Message, state: FSMContext):
+    if not await is_admin(msg.from_user.id):
+        return
+    await state.update_data(bcast=msg.html_text)
+    cnt = len(await get_all_user_ids())
+    await msg.answer(f"📢 Отправить <b>{cnt}</b> юзерам?",
+                     parse_mode="HTML", reply_markup=broadcast_confirm_kb())
+
+@dp.callback_query(F.data == "broadcast_confirm")
+async def broadcast_go(cb: types.CallbackQuery, state: FSMContext):
+    if not await admin_guard(cb):
+        return
+    d = await state.get_data()
+    text = d.get("bcast", "")
+    users = await get_all_user_ids()
+    ok = fail = 0
+    status = await cb.message.answer(f"⏳ Рассылка... 0/{len(users)}")
+    for i, uid in enumerate(users, 1):
+        try:
+            await bot.send_message(uid, text, parse_mode="HTML")
+            ok += 1
+        except Exception:
+            fail += 1
+        if i % 20 == 0:
+            try:
+                await status.edit_text(f"⏳ {i}/{len(users)}")
+            except Exception:
+                pass
+        await asyncio.sleep(0.05)
+    await status.edit_text(f"✅ Готово!\n✔️ {ok} | ❌ {fail}", reply_markup=back_admin())
+    await state.clear()
+    await cb.answer()
+
+@dp.callback_query(F.data == "users_ban")
+async def users_ban(cb: types.CallbackQuery, state: FSMContext):
+    if not await admin_guard(cb):
+        return
+    await cb.message.edit_text("🚫 Отправь <b>ID</b> для бана:", parse_mode="HTML",
+                               reply_markup=back_admin())
+    await state.set_state(S.ban)
+    await cb.answer()
+
+@dp.message(S.ban)
+async def do_ban(msg: types.Message, state: FSMContext):
+    if not await is_admin(msg.from_user.id):
+        return
+    try:
+        uid = int(msg.text.strip())
+    except ValueError:
+        await msg.answer("❌ Не число.")
+        return
+    await ban_user(uid, True)
+    await msg.answer(f"🚫 <code>{uid}</code> забанен.", parse_mode="HTML",
+                     reply_markup=back_admin())
+    await state.clear()
+
+@dp.callback_query(F.data == "users_unban")
+async def users_unban(cb: types.CallbackQuery, state: FSMContext):
+    if not await admin_guard(cb):
+        return
+    await cb.message.edit_text("✅ Отправь <b>ID</b> для разбана:", parse_mode="HTML",
+                               reply_markup=back_admin())
+    await state.set_state(S.unban)
+    await cb.answer()
+
+@dp.message(S.unban)
+async def do_unban(msg: types.Message, state: FSMContext):
+    if not await is_admin(msg.from_user.id):
+        return
+    try:
+        uid = int(msg.text.strip())
+    except ValueError:
+        await msg.answer("❌ Не число.")
+        return
+    await ban_user(uid, False)
+    await msg.answer(f"✅ <code>{uid}</code> разбанен.", parse_mode="HTML",
+                     reply_markup=back_admin())
+    await state.clear()
+
+# ============== АДМИНЫ ==============
+@dp.callback_query(F.data == "menu_admins")
+async def menu_admins(cb: types.CallbackQuery):
+    if not await admin_guard(cb):
+        return
+    await cb.message.edit_text("👮 <b>Управление админами</b>", parse_mode="HTML",
+                               reply_markup=admins_menu())
+    await cb.answer()
 
 @dp.callback_query(F.data == "admin_add_user")
-async def admin_add_user(callback: types.CallbackQuery, state: FSMContext):
-    if not await is_admin(callback.from_user.id):
+async def add_adm(cb: types.CallbackQuery, state: FSMContext):
+    if not await admin_guard(cb):
         return
-    await callback.message.edit_text(
-        "➕ <b>Добавление админа</b>\n\n"
-        "Отправь одно из:\n"
-        "• Telegram ID (число)\n"
-        "• Пересланное сообщение от нужного человека",
-        parse_mode="HTML",
-        reply_markup=back_to_admin_keyboard()
-    )
-    await state.set_state(AdminStates.waiting_new_admin)
-    await callback.answer()
+    await cb.message.edit_text(
+        "➕ Отправь <b>ID</b> или <b>перешли сообщение</b>:",
+        parse_mode="HTML", reply_markup=back_admin())
+    await state.set_state(S.admin_new)
+    await cb.answer()
 
-@dp.message(AdminStates.waiting_new_admin)
-async def process_new_admin(message: types.Message, state: FSMContext):
-    if not await is_admin(message.from_user.id):
+@dp.message(S.admin_new)
+async def do_add_adm(msg: types.Message, state: FSMContext):
+    if not await is_admin(msg.from_user.id):
         return
-
-    target_id = None
-    target_username = ""
-
-    if message.forward_from:
-        target_id = message.forward_from.id
-        target_username = message.forward_from.username or message.forward_from.full_name
-    elif message.text and message.text.strip().isdigit():
-        target_id = int(message.text.strip())
-        target_username = f"id{target_id}"
-    else:
-        await message.answer(
-            "❌ Не понял. Отправь ID числом или перешли сообщение от человека.",
-            reply_markup=back_to_admin_keyboard()
-        )
+    target = None
+    uname = ""
+    if msg.forward_from:
+        target = msg.forward_from.id
+        uname = msg.forward_from.username or msg.forward_from.full_name
+    elif msg.text and msg.text.strip().isdigit():
+        target = int(msg.text.strip())
+        uname = f"id{target}"
+    if not target:
+        await msg.answer("❌ Не понял.")
         return
-
-    if await is_admin(target_id):
-        await message.answer(
-            f"⚠️ <code>{target_id}</code> уже админ.",
-            parse_mode="HTML",
-            reply_markup=back_to_admin_keyboard()
-        )
+    if await is_admin(target):
+        await msg.answer(f"⚠️ Уже админ.", reply_markup=back_admin())
         await state.clear()
         return
-
-    await add_admin(target_id, target_username, message.from_user.id)
-    await message.answer(
-        f"✅ <b>Админ добавлен!</b>\n\n"
-        f"🆔 ID: <code>{target_id}</code>\n"
-        f"👤 {target_username}",
-        parse_mode="HTML",
-        reply_markup=back_to_admin_keyboard()
-    )
+    await add_admin(target, uname, msg.from_user.id)
+    await msg.answer(f"✅ Добавлен <code>{target}</code>", parse_mode="HTML",
+                     reply_markup=back_admin())
+    await log_action(f"👮 Новый админ: {target} (добавил {msg.from_user.id})")
     await state.clear()
 
 @dp.callback_query(F.data == "admin_list_users")
-async def admin_list_users(callback: types.CallbackQuery):
-    if not await is_admin(callback.from_user.id):
+async def list_adms(cb: types.CallbackQuery):
+    if not await admin_guard(cb):
         return
-    text = "📋 <b>Список админов:</b>\n\n"
-    text += "🌟 <b>Супер-админы (из .env):</b>\n"
-    for uid in ADMIN_IDS:
-        text += f"• <code>{uid}</code>\n"
-    text += "\n👥 <b>Обычные админы:</b>\n"
-    db_admins = await get_all_admins()
-    if not db_admins:
-        text += "<i>пусто</i>\n"
+    text = "📋 <b>Админы:</b>\n\n🌟 <b>Супер:</b>\n"
+    for u in ADMIN_IDS:
+        text += f"• <code>{u}</code>\n"
+    text += "\n👥 <b>Обычные:</b>\n"
+    dbs = await get_all_admins()
+    if not dbs:
+        text += "<i>пусто</i>"
     else:
-        for uid, uname in db_admins:
-            text += f"• <code>{uid}</code> — {uname}\n"
-    await callback.message.edit_text(
-        text,
-        parse_mode="HTML",
-        reply_markup=back_to_admin_keyboard()
-    )
-    await callback.answer()
+        for i, u in dbs:
+            text += f"• <code>{i}</code> — {u}\n"
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=back_admin())
+    await cb.answer()
 
 @dp.callback_query(F.data == "admin_del_user")
-async def admin_del_user(callback: types.CallbackQuery):
-    if not await is_admin(callback.from_user.id):
+async def del_adm(cb: types.CallbackQuery):
+    if not await admin_guard(cb):
         return
-    db_admins = await get_all_admins()
-    if not db_admins:
-        await callback.answer("В БД нет админов.", show_alert=True)
+    dbs = await get_all_admins()
+    if not dbs:
+        await cb.answer("Нет админов.", show_alert=True)
         return
-    await callback.message.edit_text(
-        "Выбери, у кого забрать админку:",
-        reply_markup=del_admins_keyboard(db_admins)
-    )
-    await callback.answer()
+    await cb.message.edit_text("Выбери:", reply_markup=del_admins_kb(dbs))
+    await cb.answer()
 
 @dp.callback_query(F.data.startswith("rmadmin_"))
-async def remove_admin_cb(callback: types.CallbackQuery):
-    if not await is_admin(callback.from_user.id):
+async def rm_adm(cb: types.CallbackQuery):
+    if not await admin_guard(cb):
         return
-    uid = int(callback.data.split("_")[1])
+    uid = int(cb.data.split("_")[1])
     if uid in ADMIN_IDS:
-        await callback.answer("Супер-админа удалить нельзя!", show_alert=True)
+        await cb.answer("Супер-админа нельзя удалить!", show_alert=True)
         return
     ok = await remove_admin(uid)
-    if ok:
-        await callback.message.edit_text(
-            f"✅ Админ <code>{uid}</code> удалён.",
-            parse_mode="HTML",
-            reply_markup=back_to_admin_keyboard()
-        )
-    else:
-        await callback.answer("Не найден.", show_alert=True)
-    await callback.answer()
+    await cb.message.edit_text(
+        f"{'✅ Удалён' if ok else '❌ Не найден'} <code>{uid}</code>",
+        parse_mode="HTML", reply_markup=back_admin())
+    await cb.answer()
 
-# ==================== ЗАПУСК ====================
+# ============== НАСТРОЙКИ ==============
+@dp.callback_query(F.data == "menu_settings")
+async def menu_settings(cb: types.CallbackQuery):
+    if not await admin_guard(cb):
+        return
+    m = await get_setting("maintenance") == "1"
+    await cb.message.edit_text("⚙️ <b>Настройки</b>", parse_mode="HTML",
+                               reply_markup=settings_menu(m))
+    await cb.answer()
+
+@dp.callback_query(F.data == "toggle_maintenance")
+async def toggle_m(cb: types.CallbackQuery):
+    if not await admin_guard(cb):
+        return
+    current = await get_setting("maintenance") == "1"
+    await set_setting("maintenance", "0" if current else "1")
+    m = await get_setting("maintenance") == "1"
+    await cb.message.edit_reply_markup(reply_markup=settings_menu(m))
+    await cb.answer("Переключено.")
+
+@dp.callback_query(F.data == "edit_welcome")
+async def edit_welcome(cb: types.CallbackQuery, state: FSMContext):
+    if not await admin_guard(cb):
+        return
+    cur = await get_setting("welcome_text")
+    await cb.message.edit_text(f"📝 Текущий:\n\n{cur}\n\nОтправь новый:",
+                               reply_markup=back_admin())
+    await state.set_state(S.welcome)
+    await cb.answer()
+
+@dp.message(S.welcome)
+async def set_welcome(msg: types.Message, state: FSMContext):
+    if not await is_admin(msg.from_user.id):
+        return
+    await set_setting("welcome_text", msg.html_text)
+    await msg.answer("✅ Приветствие обновлено.", reply_markup=back_admin())
+    await state.clear()
+
+# ============== СТАТИСТИКА ==============
+@dp.callback_query(F.data == "show_stats")
+async def show_stats(cb: types.CallbackQuery):
+    if not await admin_guard(cb):
+        return
+    s = await get_stats()
+    text = (
+        f"📊 <b>Статистика</b>\n\n"
+        f"👥 Юзеров: <b>{s['users']}</b>\n"
+        f"🚫 Забанено: <b>{s['banned']}</b>\n"
+        f"📜 Скриптов: <b>{s['scripts']}</b>\n"
+        f"👁 Просмотров: <b>{s['views']}</b>"
+    )
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=back_admin())
+    await cb.answer()
+
+# ============== ЗАПУСК ==============
 async def on_startup(bot: Bot):
     await init_db()
-    await bot.set_webhook(
-        url=WEBHOOK_URL,
-        secret_token=WEBHOOK_SECRET,
-        drop_pending_updates=True
-    )
-    logger.info(f"✅ Вебхук: {WEBHOOK_URL}")
-
-async def on_shutdown(bot: Bot):
-    await bot.delete_webhook()
+    await bot.delete_webhook(drop_pending_updates=True)
+    logger.info("✅ БД инициализирована, polling готов")
 
 async def main():
     dp.startup.register(on_startup)
-    dp.shutdown.register(on_shutdown)
-    runner = await run_server(dp, bot)
-    try:
-        await asyncio.Event().wait()
-    finally:
-        await runner.cleanup()
+    logger.info("🚀 Бот запущен (polling)")
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
